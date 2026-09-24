@@ -1,0 +1,8 @@
+{
+  "build": {
+    "builder": "RAILPACK"
+  },
+  "deploy": {
+    "startCommand": "python main.py"
+  }
+}
