@@ -1,21 +1,371 @@
+"""
+Star Pattern Signal Bot — Morning Star (1H) / Evening Star (30min, 15min)
+============================================================================
+Posts Morning Star and Evening Star signals to a private Telegram channel,
+tracks each as its own position, and posts TP/SL updates as they happen.
+
+Strategy per timeframe (validated via backtesting — see chat history):
+  1h    -> Morning Star only | SL $15 | TP1 $15 / TP2 $30 / TP3 $45
+  30min -> Evening Star only | SL $10 | TP1 $10 / TP2 $20 / TP3 $30
+  15min -> Evening Star only | SL $10 | TP1 $15 (single target)
+
+Position lifecycle (matches what was backtested):
+  - 3-target strategies (1h, 30min): TP1 is a notification only. The
+    trade's OFFICIAL result — what counts as win/loss for this bot's own
+    tracking — is TP2 (full close) vs SL. This matches the "single
+    position, official exit TP2" model that was actually backtested.
+  - 15min (single target): straightforward TP1-or-SL.
+
+Deploy this as a long-running process (Railway, same as your other bot).
+"""
+
 import requests
+import pandas as pd
+import numpy as np
+import json
+import os
 import time
+from datetime import datetime, timezone
 
-def run_test():
+# ================== CONFIG ==================
+
+TWELVEDATA_API_KEY = "YOUR_TWELVEDATA_API_KEY"
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHANNEL_ID = "YOUR_PRIVATE_CHANNEL_ID"   # see "How to get your channel ID" below
+
+SYMBOL = "XAU/USD"
+
+STATE_FILE = "open_trades.json"   # see the persistence warning in the instructions below
+
+# --- Pattern shape thresholds (the tuned/validated values from backtesting) ---
+STRONG_BODY_RATIO = 0.4
+DOJI_MAX_BODY_RATIO = 0.20
+GAP_TOLERANCE_DOLLARS = 1.5
+
+# --- RSI / swing-location filter ---
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+SWING_ORDER = 3
+SWING_LOOKBACK = 20
+SWING_TOLERANCE_DOLLARS = 3.0
+
+# --- How often the bot checks things (seconds) ---
+SIGNAL_SCAN_INTERVAL = 300   # look for new patterns every 5 minutes
+PRICE_MONITOR_INTERVAL = 60  # check open trades against live price every 60 seconds
+CANDLE_HISTORY_SIZE = 100    # candles fetched per scan — plenty for RSI/swing warmup
+
+# --- The 3 strategies this bot runs, independently ---
+STRATEGIES = {
+    "1h_morning": {
+        "interval": "1h", "pattern": "morning",
+        "sl": 15, "tp_levels": [15, 30, 45],
+    },
+    "30min_evening": {
+        "interval": "30min", "pattern": "evening",
+        "sl": 10, "tp_levels": [10, 20, 30],
+    },
+    "15min_evening": {
+        "interval": "15min", "pattern": "evening",
+        "sl": 10, "tp_levels": [15],
+    },
+}
+
+
+# ================== TELEGRAM ==================
+
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.get(
-            "https://demo-futures.kraken.com/derivatives/api/v3/tickers",
-            headers={"Accept": "application/json"},
-            timeout=15
-        )
-        print(f"Status: {r.status_code}")
-        print(f"Content-Type: {r.headers.get('Content-Type')}")
-        print(r.text[:500])
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"Telegram send failed: {r.status_code} {r.text}")
     except Exception as e:
-        print(f"Request failed: {e}")
+        print(f"Telegram send error: {e}")
 
-run_test()
-# Keep the process alive so Railway doesn't mark it as "crashed" —
-# you'll just check the logs, then delete this service when done.
-while True:
-    time.sleep(3600)
+
+# ================== PERSISTENCE ==================
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {name: {"open_trade": None, "last_signal_time": None} for name in STRATEGIES}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+# ================== DATA FETCHING ==================
+
+def fetch_recent_candles(interval, size):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": SYMBOL, "interval": interval,
+        "outputsize": size, "apikey": TWELVEDATA_API_KEY, "format": "JSON"
+    }
+    r = requests.get(url, params=params, timeout=30)
+    data = r.json()
+    if "values" not in data:
+        print(f"Candle fetch error ({interval}): {data}")
+        return None
+
+    df = pd.DataFrame(data["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df
+
+
+def fetch_live_price():
+    url = "https://api.twelvedata.com/price"
+    params = {"symbol": SYMBOL, "apikey": TWELVEDATA_API_KEY}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if "price" in data:
+            return float(data["price"])
+    except Exception as e:
+        print(f"Live price fetch error: {e}")
+    return None
+
+
+# ================== INDICATORS ==================
+
+def add_indicators(df):
+    df = df.copy()
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+    return df
+
+
+def find_swings(df, order=SWING_ORDER):
+    swing_highs, swing_lows = [], []
+    closes = df["close"].values
+    for i in range(order, len(df) - order):
+        window = closes[i - order: i + order + 1]
+        if closes[i] == window.max():
+            swing_highs.append((i, i + order, closes[i]))
+        if closes[i] == window.min():
+            swing_lows.append((i, i + order, closes[i]))
+    return swing_highs, swing_lows
+
+
+def near_recent_swing(swings, as_of_index, price, lookback, tolerance):
+    for swing_index, confirmed_at, swing_price in reversed(swings):
+        if confirmed_at > as_of_index:
+            continue
+        if as_of_index - swing_index > lookback:
+            break
+        if abs(price - swing_price) <= tolerance:
+            return True
+    return False
+
+
+# ================== PATTERN CHECK (on the LAST fully closed 3 candles) ==================
+
+def check_pattern(df, kind):
+    """
+    Checks ONLY the most recently completed 3-candle set (the last 3 rows
+    of df, since df's last row is always the most recent CLOSED candle —
+    TwelveData doesn't return the still-forming candle). Returns True if
+    a valid pattern completed there.
+    """
+    if len(df) < 30:  # need enough history for swings + RSI warmup
+        return False
+
+    df = add_indicators(df)
+    swing_highs, swing_lows = find_swings(df)
+
+    i3 = len(df) - 1
+    i2 = i3 - 1
+    i1 = i3 - 2
+
+    o1, c1, h1, l1 = df["open"][i1], df["close"][i1], df["high"][i1], df["low"][i1]
+    o2, c2, h2, l2 = df["open"][i2], df["close"][i2], df["high"][i2], df["low"][i2]
+    o3, c3 = df["open"][i3], df["close"][i3]
+
+    range1, range2 = h1 - l1, h2 - l2
+    if range1 <= 0 or range2 <= 0:
+        return False
+
+    body1, body2 = abs(c1 - o1), abs(c2 - o2)
+    midpoint1 = (o1 + c1) / 2
+
+    if kind == "morning":
+        if not (c1 < o1 and body1 >= STRONG_BODY_RATIO * range1):
+            return False
+        if not (body2 <= DOJI_MAX_BODY_RATIO * range2):
+            return False
+        if not (max(o2, c2) <= c1 + GAP_TOLERANCE_DOLLARS):
+            return False
+        if not (c3 > o3 and c3 > midpoint1):
+            return False
+        rsi_ok = df["rsi_14"][i3] < RSI_OVERSOLD
+        swing_ok = near_recent_swing(swing_lows, i2, l2, SWING_LOOKBACK, SWING_TOLERANCE_DOLLARS)
+        return rsi_ok or swing_ok
+
+    elif kind == "evening":
+        if not (c1 > o1 and body1 >= STRONG_BODY_RATIO * range1):
+            return False
+        if not (body2 <= DOJI_MAX_BODY_RATIO * range2):
+            return False
+        if not (min(o2, c2) >= c1 - GAP_TOLERANCE_DOLLARS):
+            return False
+        if not (c3 < o3 and c3 < midpoint1):
+            return False
+        rsi_ok = df["rsi_14"][i3] > RSI_OVERBOUGHT
+        swing_ok = near_recent_swing(swing_highs, i2, h2, SWING_LOOKBACK, SWING_TOLERANCE_DOLLARS)
+        return rsi_ok or swing_ok
+
+    return False
+
+
+# ================== SIGNAL SCANNING ==================
+
+def scan_for_signal(strategy_name, cfg, state):
+    slot = state[strategy_name]
+    if slot["open_trade"] is not None:
+        return  # already have an open trade for this strategy — one at a time
+
+    df = fetch_recent_candles(cfg["interval"], CANDLE_HISTORY_SIZE)
+    if df is None or len(df) < 30:
+        return
+
+    latest_candle_time = str(df["datetime"].iloc[-1])
+    if slot["last_signal_time"] == latest_candle_time:
+        return  # already evaluated this exact candle — avoid duplicate signals on restart
+
+    slot["last_signal_time"] = latest_candle_time
+
+    if check_pattern(df, cfg["pattern"]):
+        entry = float(df["close"].iloc[-1])
+        direction = "long" if cfg["pattern"] == "morning" else "short"
+        tp_levels = cfg["tp_levels"]
+        sl_dollars = cfg["sl"]
+
+        if direction == "long":
+            sl_price = entry - sl_dollars
+            tp_prices = [entry + t for t in tp_levels]
+        else:
+            sl_price = entry + sl_dollars
+            tp_prices = [entry - t for t in tp_levels]
+
+        trade = {
+            "strategy": strategy_name,
+            "direction": direction,
+            "entry": entry,
+            "sl": sl_price,
+            "tp_prices": tp_prices,
+            "tp_dollars": tp_levels,
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        }
+        slot["open_trade"] = trade
+        save_state(state)
+
+        pattern_label = "Morning Star (Bullish)" if cfg["pattern"] == "morning" else "Evening Star (Bearish)"
+        tp_lines = "\n".join([f"TP{i+1}: ${p:.2f}" for i, p in enumerate(tp_prices)])
+        msg = (
+            f"🌟 <b>NEW SIGNAL — {strategy_name}</b>\n"
+            f"{pattern_label}\n\n"
+            f"Direction: {'BUY' if direction == 'long' else 'SELL'}\n"
+            f"Entry: ${entry:.2f}\n"
+            f"SL: ${sl_price:.2f}\n"
+            f"{tp_lines}"
+        )
+        send_telegram_message(msg)
+        print(f"[{strategy_name}] New signal: {direction} @ {entry}")
+    else:
+        save_state(state)  # still save so last_signal_time dedupe persists across restarts
+
+
+# ================== TRADE MONITORING ==================
+
+def monitor_open_trade(strategy_name, cfg, state, live_price):
+    slot = state[strategy_name]
+    trade = slot["open_trade"]
+    if trade is None or live_price is None:
+        return
+
+    direction = trade["direction"]
+    sl = trade["sl"]
+    tp_prices = trade["tp_prices"]
+    n_tps = len(tp_prices)
+
+    def level_hit(level):
+        return live_price >= level if direction == "long" else live_price <= level
+
+    def sl_hit():
+        return live_price <= sl if direction == "long" else live_price >= sl
+
+    # --- SL checked first ---
+    if sl_hit():
+        send_telegram_message(f"🔴 <b>{strategy_name}</b> — SL hit @ ${live_price:.2f}. Result: LOSS")
+        slot["open_trade"] = None
+        save_state(state)
+        return
+
+    # --- Single-TP strategies (15min): TP1 is the real, final exit ---
+    if n_tps == 1:
+        if level_hit(tp_prices[0]):
+            send_telegram_message(f"🟢 <b>{strategy_name}</b> — TP1 hit @ ${live_price:.2f}. Result: WIN")
+            slot["open_trade"] = None
+            save_state(state)
+        return
+
+    # --- 3-TP strategies (1h, 30min): TP1 = notification, TP2 = official exit ---
+    if not trade["tp1_hit"] and level_hit(tp_prices[0]):
+        trade["tp1_hit"] = True
+        send_telegram_message(f"🟡 <b>{strategy_name}</b> — TP1 hit @ ${live_price:.2f} (still running to TP2)")
+        save_state(state)
+
+    if not trade["tp2_hit"] and level_hit(tp_prices[1]):
+        trade["tp2_hit"] = True
+        send_telegram_message(f"🟢 <b>{strategy_name}</b> — TP2 hit @ ${live_price:.2f}. Result: WIN (official close)")
+        slot["open_trade"] = None
+        save_state(state)
+        return
+
+
+# ================== MAIN LOOP ==================
+
+def main():
+    state = load_state()
+    send_telegram_message("✅ Star Pattern Bot started — monitoring 1h Morning, 30min Evening, 15min Evening.")
+
+    last_scan_time = 0
+
+    while True:
+        try:
+            now = time.time()
+
+            # Monitor all open trades against live price every PRICE_MONITOR_INTERVAL
+            live_price = fetch_live_price()
+            for name, cfg in STRATEGIES.items():
+                monitor_open_trade(name, cfg, state, live_price)
+
+            # Scan for new signals every SIGNAL_SCAN_INTERVAL
+            if now - last_scan_time >= SIGNAL_SCAN_INTERVAL:
+                for name, cfg in STRATEGIES.items():
+                    scan_for_signal(name, cfg, state)
+                last_scan_time = now
+
+        except Exception as e:
+            print(f"Main loop error: {e}")
+
+        time.sleep(PRICE_MONITOR_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
