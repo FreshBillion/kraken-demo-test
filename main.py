@@ -117,7 +117,8 @@ def fetch_recent_candles(interval, size):
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL, "interval": interval,
-        "outputsize": size, "apikey": TWELVEDATA_API_KEY, "format": "JSON"
+        "outputsize": size, "apikey": TWELVEDATA_API_KEY, "format": "JSON",
+        "timezone": "UTC",
     }
     r = requests.get(url, params=params, timeout=30)
     data = r.json()
