@@ -52,8 +52,8 @@ SWING_LOOKBACK = 20
 SWING_TOLERANCE_DOLLARS = 3.0
 
 # --- How often the bot checks things (seconds) ---
-SIGNAL_SCAN_INTERVAL = 300
-PRICE_MONITOR_INTERVAL = 60
+SIGNAL_SCAN_INTERVAL = 900
+PRICE_MONITOR_INTERVAL = 180
 CANDLE_HISTORY_SIZE = 100
 
 # --- The 3 strategies this bot runs, independently ---
