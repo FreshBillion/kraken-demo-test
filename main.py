@@ -342,7 +342,7 @@ def monitor_open_trade(strategy_name, cfg, state, live_price):
 
 def main():
     state = load_state()
-    send_telegram_message("✅ Star Pattern Bot started — monitoring 1h Morning, 30min Evening, 15min Evening.")
+    send_telegram_message("✅ Bot started")
 
     last_scan_time = 0
 
