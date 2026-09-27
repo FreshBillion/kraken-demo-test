@@ -28,14 +28,15 @@ import time
 from datetime import datetime, timezone
 
 # ================== CONFIG ==================
+# ================== CONFIG ==================
 
-TWELVEDATA_API_KEY = "YOUR_TWELVEDATA_API_KEY"
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHANNEL_ID = "YOUR_PRIVATE_CHANNEL_ID"   # see "How to get your channel ID" below
+TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
 SYMBOL = "XAU/USD"
 
-STATE_FILE = "open_trades.json"   # see the persistence warning in the instructions below
+STATE_FILE = "open_trades.json"   # see the persistence warning from before
 
 # --- Pattern shape thresholds (the tuned/validated values from backtesting) ---
 STRONG_BODY_RATIO = 0.4
@@ -51,9 +52,9 @@ SWING_LOOKBACK = 20
 SWING_TOLERANCE_DOLLARS = 3.0
 
 # --- How often the bot checks things (seconds) ---
-SIGNAL_SCAN_INTERVAL = 300   # look for new patterns every 5 minutes
-PRICE_MONITOR_INTERVAL = 60  # check open trades against live price every 60 seconds
-CANDLE_HISTORY_SIZE = 100    # candles fetched per scan — plenty for RSI/swing warmup
+SIGNAL_SCAN_INTERVAL = 300
+PRICE_MONITOR_INTERVAL = 60
+CANDLE_HISTORY_SIZE = 100
 
 # --- The 3 strategies this bot runs, independently ---
 STRATEGIES = {
@@ -70,7 +71,6 @@ STRATEGIES = {
         "sl": 10, "tp_levels": [15],
     },
 }
-
 
 # ================== TELEGRAM ==================
 
