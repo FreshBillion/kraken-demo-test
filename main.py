@@ -315,6 +315,22 @@ def scan_for_signal(strategy_name, cfg, state):
         print(f"[{ts}] [{strategy_name}] EXCEPTION during scan: {e}")
 
 
+# Add this function anywhere above main():
+
+def compute_next_aligned_scan(interval_seconds, buffer_seconds=30, now=None):
+    """
+    Returns the next UTC epoch time that is a clean multiple of
+    interval_seconds (e.g. :00/:15/:30/:45 for 900s), plus a small buffer
+    to give TwelveData time to publish the just-closed candle.
+    """
+    if now is None:
+        now = time.time()
+    last_boundary = (int(now) // interval_seconds) * interval_seconds
+    candidate = last_boundary + buffer_seconds
+    if candidate <= now:
+        candidate += interval_seconds
+    return candidate
+
 # ================== TRADE MONITORING ==================
 
 def monitor_open_trade(strategy_name, cfg, state, live_price):
@@ -364,9 +380,12 @@ def monitor_open_trade(strategy_name, cfg, state, live_price):
 
 def main():
     state = load_state()
-    send_telegram_message("✅ Bot started — monitoring....")
+    send_telegram_message("✅ Bot started — monitoring...")
 
-    last_scan_time = {name: 0 for name in STRATEGIES}
+    next_scan_time = {
+        name: compute_next_aligned_scan(cfg["scan_interval"])
+        for name, cfg in STRATEGIES.items()
+    }
     last_monitor_time = 0
 
     while True:
@@ -384,11 +403,11 @@ def main():
                     print(f"[{ts}] price monitor skipped — no open trades")
                 last_monitor_time = now
 
-            # --- Signal scanning: each strategy on its OWN cadence now ---
+            # --- Signal scanning: aligned to each strategy's real candle-close time ---
             for name, cfg in STRATEGIES.items():
-                if now - last_scan_time[name] >= cfg["scan_interval"]:
+                if now >= next_scan_time[name]:
                     scan_for_signal(name, cfg, state)
-                    last_scan_time[name] = now
+                    next_scan_time[name] = compute_next_aligned_scan(cfg["scan_interval"], now=now)
 
         except Exception as e:
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
