@@ -3,20 +3,26 @@ Star Pattern Signal Bot — Morning Star (1H) / Evening Star (30min, 15min)
 ============================================================================
 Posts Morning Star and Evening Star signals to a private Telegram channel,
 tracks each as its own position, and posts TP/SL updates as they happen.
+Does NOT auto-execute trades — signal posting only.
 
-Strategy per timeframe (validated via backtesting — see chat history):
+Strategy per timeframe (validated via backtesting):
   1h    -> Morning Star only | SL $15 | TP1 $15 / TP2 $30 / TP3 $45
   30min -> Evening Star only | SL $10 | TP1 $10 / TP2 $20 / TP3 $30
   15min -> Evening Star only | SL $10 | TP1 $15 (single target)
 
-Position lifecycle (matches what was backtested):
-  - 3-target strategies (1h, 30min): TP1 is a notification only. The
-    trade's OFFICIAL result — what counts as win/loss for this bot's own
-    tracking — is TP2 (full close) vs SL. This matches the "single
-    position, official exit TP2" model that was actually backtested.
+Position lifecycle:
+  - 3-target strategies (1h, 30min): TP1 = notification only. Official
+    result (win/loss) is TP2 (full close) vs SL.
   - 15min (single target): straightforward TP1-or-SL.
 
-Deploy this as a long-running process (Railway, same as your other bot).
+API budget (TwelveData free tier, 800 calls/day):
+  - Signal scanning: 3 strategies x every 15 min = 288 calls/day (ALWAYS
+    runs — this is how signals get found, can't be made conditional)
+  - Price monitoring: only runs when at least one trade is open, so a
+    day with zero signals stays near the 288 baseline; each concurrently
+    open trade adds up to 480 calls/day at the 3-min interval
+
+Deploy as a long-running process (Railway).
 """
 
 import requests
@@ -28,7 +34,6 @@ import time
 from datetime import datetime, timezone
 
 # ================== CONFIG ==================
-# ================== CONFIG ==================
 
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -36,9 +41,9 @@ TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
 SYMBOL = "XAU/USD"
 
-STATE_FILE = "open_trades.json"   # see the persistence warning from before
+STATE_FILE = "open_trades.json"   # persistence warning from earlier still applies
 
-# --- Pattern shape thresholds (the tuned/validated values from backtesting) ---
+# --- Pattern shape thresholds (tuned/validated values) ---
 STRONG_BODY_RATIO = 0.4
 DOJI_MAX_BODY_RATIO = 0.20
 GAP_TOLERANCE_DOLLARS = 1.5
@@ -52,8 +57,8 @@ SWING_LOOKBACK = 20
 SWING_TOLERANCE_DOLLARS = 3.0
 
 # --- How often the bot checks things (seconds) ---
-SIGNAL_SCAN_INTERVAL = 900
-PRICE_MONITOR_INTERVAL = 180
+SIGNAL_SCAN_INTERVAL = 900    # 15 min — always runs, this is the API floor
+PRICE_MONITOR_INTERVAL = 180  # 3 min — only fires API calls when a trade is open
 CANDLE_HISTORY_SIZE = 100
 
 # --- The 3 strategies this bot runs, independently ---
@@ -61,14 +66,17 @@ STRATEGIES = {
     "1h_morning": {
         "interval": "1h", "pattern": "morning",
         "sl": 12, "tp_levels": [15, 30, 45],
+        "scan_interval": 3600,   # 1 hour — matches this strategy's own candle close
     },
     "30min_evening": {
         "interval": "30min", "pattern": "evening",
         "sl": 10, "tp_levels": [10, 20, 30],
+        "scan_interval": 1800,   # 30 min
     },
     "15min_evening": {
         "interval": "15min", "pattern": "evening",
         "sl": 10, "tp_levels": [15],
+        "scan_interval": 900,    # 15 min
     },
 }
 
@@ -97,6 +105,10 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2, default=str)
+
+
+def any_trade_open(state):
+    return any(state[name]["open_trade"] is not None for name in STRATEGIES)
 
 
 # ================== DATA FETCHING ==================
@@ -171,17 +183,9 @@ def near_recent_swing(swings, as_of_index, price, lookback, tolerance):
     return False
 
 
-# ================== PATTERN CHECK (on the LAST fully closed 3 candles) ==================
+# ================== PATTERN CHECK (with diagnostic reason) ==================
 
-
-# ================== PATTERN CHECK (with diagnostic logging) ==================
-
-def check_pattern(df, kind, strategy_name):
-    """
-    Checks the most recently completed 3-candle set. Returns (True/False, reason)
-    — the reason string explains exactly which check passed/failed, printed by
-    the caller so Railway logs show what the bot is actually seeing each scan.
-    """
+def check_pattern(df, kind):
     if len(df) < 30:
         return False, "not enough candle history yet (warming up)"
 
@@ -261,7 +265,7 @@ def scan_for_signal(strategy_name, cfg, state):
 
         slot["last_signal_time"] = latest_candle_time
 
-        found, reason = check_pattern(df, cfg["pattern"], strategy_name)
+        found, reason = check_pattern(df, cfg["pattern"])
         print(f"[{ts}] [{strategy_name}] scanned candle {latest_candle_time} — {reason}")
 
         if found:
@@ -310,8 +314,6 @@ def scan_for_signal(strategy_name, cfg, state):
         print(f"[{ts}] [{strategy_name}] EXCEPTION during scan: {e}")
 
 
-
-
 # ================== TRADE MONITORING ==================
 
 def monitor_open_trade(strategy_name, cfg, state, live_price):
@@ -331,14 +333,12 @@ def monitor_open_trade(strategy_name, cfg, state, live_price):
     def sl_hit():
         return live_price <= sl if direction == "long" else live_price >= sl
 
-    # --- SL checked first ---
     if sl_hit():
         send_telegram_message(f"🔴 <b>{strategy_name}</b> — SL hit @ ${live_price:.2f}. Result: LOSS")
         slot["open_trade"] = None
         save_state(state)
         return
 
-    # --- Single-TP strategies (15min): TP1 is the real, final exit ---
     if n_tps == 1:
         if level_hit(tp_prices[0]):
             send_telegram_message(f"🟢 <b>{strategy_name}</b> — TP1 hit @ ${live_price:.2f}. Result: WIN")
@@ -346,7 +346,6 @@ def monitor_open_trade(strategy_name, cfg, state, live_price):
             save_state(state)
         return
 
-    # --- 3-TP strategies (1h, 30min): TP1 = notification, TP2 = official exit ---
     if not trade["tp1_hit"] and level_hit(tp_prices[0]):
         trade["tp1_hit"] = True
         send_telegram_message(f"🟡 <b>{strategy_name}</b> — TP1 hit @ ${live_price:.2f} (still running to TP2)")
@@ -364,30 +363,37 @@ def monitor_open_trade(strategy_name, cfg, state, live_price):
 
 def main():
     state = load_state()
-    send_telegram_message("✅ Bot-started")
+    send_telegram_message("✅ Star Pattern Bot started — monitoring 1h Morning, 30min Evening, 15min Evening.")
 
-    last_scan_time = 0
+    last_scan_time = {name: 0 for name in STRATEGIES}
+    last_monitor_time = 0
 
     while True:
         try:
             now = time.time()
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            # Monitor all open trades against live price every PRICE_MONITOR_INTERVAL
-            live_price = fetch_live_price()
+            # --- Price monitoring: only spends an API call if a trade is actually open ---
+            if now - last_monitor_time >= PRICE_MONITOR_INTERVAL:
+                if any_trade_open(state):
+                    live_price = fetch_live_price()
+                    for name, cfg in STRATEGIES.items():
+                        monitor_open_trade(name, cfg, state, live_price)
+                else:
+                    print(f"[{ts}] price monitor skipped — no open trades")
+                last_monitor_time = now
+
+            # --- Signal scanning: each strategy on its OWN cadence now ---
             for name, cfg in STRATEGIES.items():
-                monitor_open_trade(name, cfg, state, live_price)
-
-            # Scan for new signals every SIGNAL_SCAN_INTERVAL
-            if now - last_scan_time >= SIGNAL_SCAN_INTERVAL:
-                for name, cfg in STRATEGIES.items():
+                if now - last_scan_time[name] >= cfg["scan_interval"]:
                     scan_for_signal(name, cfg, state)
-                last_scan_time = now
+                    last_scan_time[name] = now
 
         except Exception as e:
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{ts}] Main loop error: {e}")
 
-        time.sleep(PRICE_MONITOR_INTERVAL)
+        time.sleep(10)
 
 
 if __name__ == "__main__":
