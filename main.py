@@ -173,15 +173,17 @@ def near_recent_swing(swings, as_of_index, price, lookback, tolerance):
 
 # ================== PATTERN CHECK (on the LAST fully closed 3 candles) ==================
 
-def check_pattern(df, kind):
+
+# ================== PATTERN CHECK (with diagnostic logging) ==================
+
+def check_pattern(df, kind, strategy_name):
     """
-    Checks ONLY the most recently completed 3-candle set (the last 3 rows
-    of df, since df's last row is always the most recent CLOSED candle —
-    TwelveData doesn't return the still-forming candle). Returns True if
-    a valid pattern completed there.
+    Checks the most recently completed 3-candle set. Returns (True/False, reason)
+    — the reason string explains exactly which check passed/failed, printed by
+    the caller so Railway logs show what the bot is actually seeing each scan.
     """
-    if len(df) < 30:  # need enough history for swings + RSI warmup
-        return False
+    if len(df) < 30:
+        return False, "not enough candle history yet (warming up)"
 
     df = add_indicators(df)
     swing_highs, swing_lows = find_swings(df)
@@ -189,6 +191,7 @@ def check_pattern(df, kind):
     i3 = len(df) - 1
     i2 = i3 - 1
     i1 = i3 - 2
+    candle_time = df["datetime"][i3]
 
     o1, c1, h1, l1 = df["open"][i1], df["close"][i1], df["high"][i1], df["low"][i1]
     o2, c2, h2, l2 = df["open"][i2], df["close"][i2], df["high"][i2], df["low"][i2]
@@ -196,98 +199,117 @@ def check_pattern(df, kind):
 
     range1, range2 = h1 - l1, h2 - l2
     if range1 <= 0 or range2 <= 0:
-        return False
+        return False, f"zero-range candle at {candle_time} (bad data?)"
 
     body1, body2 = abs(c1 - o1), abs(c2 - o2)
     midpoint1 = (o1 + c1) / 2
+    rsi_now = df["rsi_14"][i3]
 
     if kind == "morning":
         if not (c1 < o1 and body1 >= STRONG_BODY_RATIO * range1):
-            return False
+            return False, f"Candle1 not a strong bearish candle (body {body1:.2f} / range {range1:.2f})"
         if not (body2 <= DOJI_MAX_BODY_RATIO * range2):
-            return False
+            return False, f"Candle2 not a doji (body {body2:.2f} / range {range2:.2f})"
         if not (max(o2, c2) <= c1 + GAP_TOLERANCE_DOLLARS):
-            return False
+            return False, "Candle2 not positioned at bottom of Candle1's body"
         if not (c3 > o3 and c3 > midpoint1):
-            return False
-        rsi_ok = df["rsi_14"][i3] < RSI_OVERSOLD
+            return False, f"Candle3 didn't close bullish past Candle1 midpoint ({midpoint1:.2f})"
+        rsi_ok = rsi_now < RSI_OVERSOLD
         swing_ok = near_recent_swing(swing_lows, i2, l2, SWING_LOOKBACK, SWING_TOLERANCE_DOLLARS)
-        return rsi_ok or swing_ok
+        if not (rsi_ok or swing_ok):
+            return False, f"shape matched but RSI {rsi_now:.1f} not oversold and no nearby swing low"
+        return True, f"Morning Star confirmed (RSI {rsi_now:.1f}, swing_low_nearby={swing_ok})"
 
     elif kind == "evening":
         if not (c1 > o1 and body1 >= STRONG_BODY_RATIO * range1):
-            return False
+            return False, f"Candle1 not a strong bullish candle (body {body1:.2f} / range {range1:.2f})"
         if not (body2 <= DOJI_MAX_BODY_RATIO * range2):
-            return False
+            return False, f"Candle2 not a doji (body {body2:.2f} / range {range2:.2f})"
         if not (min(o2, c2) >= c1 - GAP_TOLERANCE_DOLLARS):
-            return False
+            return False, "Candle2 not positioned at top of Candle1's body"
         if not (c3 < o3 and c3 < midpoint1):
-            return False
-        rsi_ok = df["rsi_14"][i3] > RSI_OVERBOUGHT
+            return False, f"Candle3 didn't close bearish past Candle1 midpoint ({midpoint1:.2f})"
+        rsi_ok = rsi_now > RSI_OVERBOUGHT
         swing_ok = near_recent_swing(swing_highs, i2, h2, SWING_LOOKBACK, SWING_TOLERANCE_DOLLARS)
-        return rsi_ok or swing_ok
+        if not (rsi_ok or swing_ok):
+            return False, f"shape matched but RSI {rsi_now:.1f} not overbought and no nearby swing high"
+        return True, f"Evening Star confirmed (RSI {rsi_now:.1f}, swing_high_nearby={swing_ok})"
 
-    return False
+    return False, "unknown pattern kind"
 
 
-# ================== SIGNAL SCANNING ==================
+# ================== SIGNAL SCANNING (with logging) ==================
 
 def scan_for_signal(strategy_name, cfg, state):
-    slot = state[strategy_name]
-    if slot["open_trade"] is not None:
-        return  # already have an open trade for this strategy — one at a time
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    df = fetch_recent_candles(cfg["interval"], CANDLE_HISTORY_SIZE)
-    if df is None or len(df) < 30:
-        return
+    try:
+        slot = state[strategy_name]
+        if slot["open_trade"] is not None:
+            print(f"[{ts}] [{strategy_name}] skip scan — trade already open")
+            return
 
-    latest_candle_time = str(df["datetime"].iloc[-1])
-    if slot["last_signal_time"] == latest_candle_time:
-        return  # already evaluated this exact candle — avoid duplicate signals on restart
+        df = fetch_recent_candles(cfg["interval"], CANDLE_HISTORY_SIZE)
+        if df is None or len(df) < 30:
+            print(f"[{ts}] [{strategy_name}] ERROR — candle fetch failed or insufficient data")
+            return
 
-    slot["last_signal_time"] = latest_candle_time
+        latest_candle_time = str(df["datetime"].iloc[-1])
+        if slot["last_signal_time"] == latest_candle_time:
+            print(f"[{ts}] [{strategy_name}] no new closed candle since last scan ({latest_candle_time})")
+            return
 
-    if check_pattern(df, cfg["pattern"]):
-        entry = float(df["close"].iloc[-1])
-        direction = "long" if cfg["pattern"] == "morning" else "short"
-        tp_levels = cfg["tp_levels"]
-        sl_dollars = cfg["sl"]
+        slot["last_signal_time"] = latest_candle_time
 
-        if direction == "long":
-            sl_price = entry - sl_dollars
-            tp_prices = [entry + t for t in tp_levels]
+        found, reason = check_pattern(df, cfg["pattern"], strategy_name)
+        print(f"[{ts}] [{strategy_name}] scanned candle {latest_candle_time} — {reason}")
+
+        if found:
+            entry = float(df["close"].iloc[-1])
+            direction = "long" if cfg["pattern"] == "morning" else "short"
+            tp_levels = cfg["tp_levels"]
+            sl_dollars = cfg["sl"]
+
+            if direction == "long":
+                sl_price = entry - sl_dollars
+                tp_prices = [entry + t for t in tp_levels]
+            else:
+                sl_price = entry + sl_dollars
+                tp_prices = [entry - t for t in tp_levels]
+
+            trade = {
+                "strategy": strategy_name,
+                "direction": direction,
+                "entry": entry,
+                "sl": sl_price,
+                "tp_prices": tp_prices,
+                "tp_dollars": tp_levels,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+            }
+            slot["open_trade"] = trade
+            save_state(state)
+
+            pattern_label = "Morning Star (Bullish)" if cfg["pattern"] == "morning" else "Evening Star (Bearish)"
+            tp_lines = "\n".join([f"TP{i+1}: ${p:.2f}" for i, p in enumerate(tp_prices)])
+            msg = (
+                f"🌟 <b>NEW SIGNAL — {strategy_name}</b>\n"
+                f"{pattern_label}\n\n"
+                f"Direction: {'BUY' if direction == 'long' else 'SELL'}\n"
+                f"Entry: ${entry:.2f}\n"
+                f"SL: ${sl_price:.2f}\n"
+                f"{tp_lines}"
+            )
+            send_telegram_message(msg)
+            print(f"[{ts}] [{strategy_name}] *** SIGNAL SENT *** {direction} @ {entry}")
         else:
-            sl_price = entry + sl_dollars
-            tp_prices = [entry - t for t in tp_levels]
+            save_state(state)
 
-        trade = {
-            "strategy": strategy_name,
-            "direction": direction,
-            "entry": entry,
-            "sl": sl_price,
-            "tp_prices": tp_prices,
-            "tp_dollars": tp_levels,
-            "tp1_hit": False,
-            "tp2_hit": False,
-            "opened_at": datetime.now(timezone.utc).isoformat(),
-        }
-        slot["open_trade"] = trade
-        save_state(state)
+    except Exception as e:
+        print(f"[{ts}] [{strategy_name}] EXCEPTION during scan: {e}")
 
-        pattern_label = "Morning Star (Bullish)" if cfg["pattern"] == "morning" else "Evening Star (Bearish)"
-        tp_lines = "\n".join([f"TP{i+1}: ${p:.2f}" for i, p in enumerate(tp_prices)])
-        msg = (
-            f"🌟 <b>NEW SIGNAL — {strategy_name}</b>\n"
-            f"{pattern_label}\n\n"
-            f"Direction: {'BUY' if direction == 'long' else 'SELL'}\n"
-            f"Entry: ${entry:.2f}\n"
-            f"SL: ${sl_price:.2f}\n"
-            f"{tp_lines}"
-        )
-        send_telegram_message(msg)
-        print(f"[{strategy_name}] New signal: {direction} @ {entry}")
-    else:
-        save_state(state)  # still save so last_signal_time dedupe persists across restarts
+
 
 
 # ================== TRADE MONITORING ==================
@@ -362,7 +384,8 @@ def main():
                 last_scan_time = now
 
         except Exception as e:
-            print(f"Main loop error: {e}")
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}] Main loop error: {e}")
 
         time.sleep(PRICE_MONITOR_INTERVAL)
 
