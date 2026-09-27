@@ -60,7 +60,7 @@ CANDLE_HISTORY_SIZE = 100
 STRATEGIES = {
     "1h_morning": {
         "interval": "1h", "pattern": "morning",
-        "sl": 15, "tp_levels": [15, 30, 45],
+        "sl": 12, "tp_levels": [15, 30, 45],
     },
     "30min_evening": {
         "interval": "30min", "pattern": "evening",
@@ -342,7 +342,7 @@ def monitor_open_trade(strategy_name, cfg, state, live_price):
 
 def main():
     state = load_state()
-    send_telegram_message("✅ Bot started")
+    send_telegram_message("✅ Bot-started")
 
     last_scan_time = 0
 
