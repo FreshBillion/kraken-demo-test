@@ -243,6 +243,28 @@ def check_pattern(df, kind):
     return False, "unknown pattern kind"
 
 
+
+
+
+
+def display_label(cfg):
+    """Public-facing label — hides pattern name and internal strategy key."""
+    tf_map = {"1h": "1H", "30min": "30M", "15min": "15M"}
+    tf = tf_map.get(cfg["interval"], cfg["interval"])
+    bias = "Bullish" if cfg["pattern"] == "morning" else "Bearish"
+    return f"{tf} ({bias})"
+
+
+def conflicting_direction_open(state, new_direction):
+    """Checks ALL strategies' open trades for an opposite-direction conflict."""
+    for name, slot in state.items():
+        t = slot.get("open_trade")
+        if t is not None and t["direction"] != new_direction:
+            return True, name
+    return False, None
+
+
+
 # ================== SIGNAL SCANNING (with logging) ==================
 
 def scan_for_signal(strategy_name, cfg, state):
@@ -269,9 +291,18 @@ def scan_for_signal(strategy_name, cfg, state):
         found, reason = check_pattern(df, cfg["pattern"])
         print(f"[{ts}] [{strategy_name}] scanned candle {latest_candle_time} — {reason}")
 
+    
         if found:
-            entry = float(df["close"].iloc[-1])
             direction = "long" if cfg["pattern"] == "morning" else "short"
+
+            conflict, conflicting_name = conflicting_direction_open(state, direction)
+            if conflict:
+                print(f"[{ts}] [{strategy_name}] signal found but SUPPRESSED — "
+                      f"conflicts with open {conflicting_name} trade (opposite direction)")
+                save_state(state)
+                return
+
+            entry = float(df["close"].iloc[-1])
             tp_levels = cfg["tp_levels"]
             sl_dollars = cfg["sl"]
 
@@ -291,17 +322,18 @@ def scan_for_signal(strategy_name, cfg, state):
                 "tp_dollars": tp_levels,
                 "tp1_hit": False,
                 "tp2_hit": False,
+                "tp3_hit": False,
+                "breakeven_active": False,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
             }
             slot["open_trade"] = trade
             save_state(state)
 
-            pattern_label = "Morning Star (Bullish)" if cfg["pattern"] == "morning" else "Evening Star (Bearish)"
+            label = display_label(cfg)
             tp_lines = "\n".join([f"TP{i+1}: ${p:.2f}" for i, p in enumerate(tp_prices)])
             msg = (
-                f"🌟 <b>NEW SIGNAL — {strategy_name}</b>\n"
-                f"{pattern_label}\n\n"
-                f"Direction: {'BUY' if direction == 'long' else 'SELL'}\n"
+                f"🌟 <b>NEW SIGNAL — {label}</b>\n\n"
+                f"{'BUY' if direction == 'long' else 'SELL'}\n"
                 f"Entry: ${entry:.2f}\n"
                 f"SL: ${sl_price:.2f}\n"
                 f"{tp_lines}"
@@ -309,7 +341,7 @@ def scan_for_signal(strategy_name, cfg, state):
             send_telegram_message(msg)
             print(f"[{ts}] [{strategy_name}] *** SIGNAL SENT *** {direction} @ {entry}")
         else:
-            save_state(state)
+            save_state(state) 
 
     except Exception as e:
         print(f"[{ts}] [{strategy_name}] EXCEPTION during scan: {e}")
@@ -340,37 +372,55 @@ def monitor_open_trade(strategy_name, cfg, state, live_price):
         return
 
     direction = trade["direction"]
-    sl = trade["sl"]
     tp_prices = trade["tp_prices"]
     n_tps = len(tp_prices)
+    label = display_label(cfg)
 
     def level_hit(level):
         return live_price >= level if direction == "long" else live_price <= level
 
-    def sl_hit():
-        return live_price <= sl if direction == "long" else live_price >= sl
+    def sl_hit(level):
+        return live_price <= level if direction == "long" else live_price >= level
 
-    if sl_hit():
-        send_telegram_message(f"🔴 <b>{strategy_name}</b> — SL hit @ ${live_price:.2f}. Result: LOSS")
+    # Current SL — may be the original, or breakeven if TP2 already moved it
+    if sl_hit(trade["sl"]):
+        if trade["breakeven_active"]:
+            send_telegram_message(
+                f"⚪ <b>{label}</b> — closed at breakeven @ ${live_price:.2f}. "
+                f"TP1/TP2 profit locked in, no loss on the remaining position."
+            )
+        else:
+            send_telegram_message(f"🔴 <b>{label}</b> — SL hit @ ${live_price:.2f}. Result: LOSS")
         slot["open_trade"] = None
         save_state(state)
         return
 
     if n_tps == 1:
         if level_hit(tp_prices[0]):
-            send_telegram_message(f"🟢 <b>{strategy_name}</b> — TP1 hit @ ${live_price:.2f}. Result: WIN")
+            send_telegram_message(f"🟢 <b>{label}</b> — TP1 hit @ ${live_price:.2f}. Result: WIN")
             slot["open_trade"] = None
             save_state(state)
         return
 
+    # 3-TP strategies
     if not trade["tp1_hit"] and level_hit(tp_prices[0]):
         trade["tp1_hit"] = True
-        send_telegram_message(f"🟡 <b>{strategy_name}</b> — TP1 hit @ ${live_price:.2f} (still running to TP2)")
+        send_telegram_message(f"🟡 <b>{label}</b> — TP1 hit @ ${live_price:.2f} (still running)")
         save_state(state)
 
     if not trade["tp2_hit"] and level_hit(tp_prices[1]):
         trade["tp2_hit"] = True
-        send_telegram_message(f"🟢 <b>{strategy_name}</b> — TP2 hit @ ${live_price:.2f}. Result: WIN (official close)")
+        trade["sl"] = trade["entry"]
+        trade["breakeven_active"] = True
+        send_telegram_message(
+            f"🟡 <b>{label}</b> — TP2 hit @ ${live_price:.2f}. "
+            f"SL moved to breakeven (${trade['entry']:.2f}). Now targeting TP3."
+        )
+        save_state(state)
+
+    if trade["tp2_hit"] and not trade["tp3_hit"] and level_hit(tp_prices[2]):
+        trade["tp3_hit"] = True
+        send_telegram_message(f"🟢 <b>{label}</b> — TP3 hit @ ${live_price:.2f}. Result: FULL WIN 🎯")
         slot["open_trade"] = None
         save_state(state)
         return
